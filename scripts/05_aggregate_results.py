@@ -59,7 +59,8 @@ def main():
 
     gen = df[df.exp.isin(["E3_generalization", "E4_ablation"]) & df.is_primary]
     if len(gen):
-        order = ["entity_prior", "rf", "concat_mlp", "concat_mlp_reg", "siamese_sum", "siamese"]
+        order = ["entity_prior", "rf", "concat_mlp", "concat_mlp_reg", "siamese_sum", "siamese",
+                 "gnn_siamese", "de_crossnet_no_fp", "de_crossnet_self_attn", "de_crossnet"]
         sp_order = [s for s in ["random_pair", "cold_drug", "cold_excipient", "cold_both"] if s in set(gen.split)]
         t = gen.groupby(["split", "model"]).agg(**{k: (k, pm) for k in M}, n_seeds=("seed", "size"),
                                                 avg_test_pos=("n_test_pos", "mean")).reset_index()

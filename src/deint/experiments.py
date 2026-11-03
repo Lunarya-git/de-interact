@@ -1,4 +1,8 @@
-"""One experiment run = (experiment, model, split kind, seed).  Writes a self-contained run directory."""
+"""One experiment run = (experiment, model, split kind, seed).  Writes a self-contained run directory.
+
+Extended in v3 to support graph-based models (DE-CrossNet, GNN Siamese) and the
+independent entity-pool evaluation protocol.
+"""
 from __future__ import annotations
 import json, time
 from pathlib import Path
@@ -16,12 +20,17 @@ from .splits import make_split
 from .train import fit, predict_scores, save_checkpoint
 from .utils import (Timer, file_logger, now_id, prepare_run_dir, resolve, save_json, set_seed)
 
-NEURAL = {"paper_ann", "concat_mlp", "concat_mlp_reg", "siamese", "siamese_sum"}
-CLASSICAL = {"rf", "entity_prior"}
+NEURAL     = {"paper_ann", "concat_mlp", "concat_mlp_reg", "siamese", "siamese_sum"}
+GNN_NEURAL = {"de_crossnet", "gnn_siamese", "de_crossnet_no_fp", "de_crossnet_self_attn", "de_crossnet_ordered_head"}
+CLASSICAL  = {"rf", "entity_prior"}
+ALL_MODELS = NEURAL | GNN_NEURAL | CLASSICAL
 
 
 class Context:
-    """Loads cached tables + fingerprints once; shared by every run."""
+    """Loads cached tables + fingerprints once; shared by every run.
+
+    Also lazily loads the molecular graph cache when a graph model is requested.
+    """
     def __init__(self, cfg: dict, device):
         self.cfg, self.device = cfg, device
         proc = resolve(cfg, "processed_dir"); self.proc = proc
@@ -33,26 +42,65 @@ class Context:
         def keep(t): return t[t.drug_cid.isin(good) & t.excipient_cid.isin(good)].reset_index(drop=True)
         self.n_dropped_pairs = len(pairs) - len(keep(pairs))
         self.pairs, self.raw = keep(pairs), keep(raw)
-        self.leakage_unit = cfg["split"].get("leakage_unit", "cid")     # cid | structure | parent
+        # Leakage unit: cid | chem | struct | parent
+        self.leakage_unit = cfg["split"].get("leakage_unit", "chem")
         self.groups = None
         if self.leakage_unit != "cid":
             sg = pd.read_csv(proc / "structure_groups.csv")
-            self.groups = dict(zip(sg.cid.astype(int), sg[f"{self.leakage_unit}_group" if self.leakage_unit == "parent" else "struct_group"].astype(int)))
+            col = {
+                "chem":   "chem_group",
+                "struct": "struct_group",
+                "parent": "parent_group",
+            }.get(self.leakage_unit, "chem_group")
+            if col not in sg.columns:
+                raise ValueError(f"Column '{col}' not found in structure_groups.csv. "
+                                 f"Re-run script 03 to rebuild structure groups with the updated code.")
+            self.groups = dict(zip(sg.cid.astype(int), sg[col].astype(int)))
         self.F_np = fp.astype(np.float32)
         self.F = torch.tensor(self.F_np, device=device)
+        # Fingerprint lookup by CID (for GNN models)
+        self.fp_by_cid: dict[int, int] = {int(c): i for i, c in enumerate(cids)}
         plots.set_dpi(cfg["plots"]["dpi"])
+
+        # Lazy graph cache
+        self._graph_cache = None
+
+    @property
+    def graph_cache(self):
+        """Lazy-load graph cache for graph-based models."""
+        if self._graph_cache is None:
+            from .graphs import build_graph_cache
+            mols = pd.read_csv(self.proc / "molecules.csv")
+            cache, stats = build_graph_cache(mols)
+            self._graph_cache = cache
+            import logging
+            logging.getLogger("deint.context").info(
+                f"Graph cache: {stats['n_total']} molecules, "
+                f"{stats['n_invalid']} invalid, "
+                f"{stats['n_oversized']} oversized (>{200} atoms), "
+                f"max {stats['max_atoms_seen']} atoms"
+            )
+        return self._graph_cache
 
     def table(self, split_kind: str) -> pd.DataFrame:
         return self.raw if split_kind == "paper_rows" else self.pairs
 
     def idx(self, t: pd.DataFrame):
-        return (t.drug_cid.map(self.row).values.astype(np.int64), t.excipient_cid.map(self.row).values.astype(np.int64))
+        return (t.drug_cid.map(self.row).values.astype(np.int64),
+                t.excipient_cid.map(self.row).values.astype(np.int64))
 
     def get_split(self, kind: str, seed: int) -> dict:
         d = self.proc / "splits"; d.mkdir(exist_ok=True)
         f = d / f"{kind}__{self.leakage_unit}__seed{seed}.json"
         if f.exists():
-            return json.load(open(f))
+            cached = json.load(open(f))
+            # Guard: reject legacy splits cached under a different leakage_unit default
+            if cached.get("report", {}).get("leakage_unit", "cid") != (
+                    "structure_group" if self.leakage_unit != "cid" else "cid"):
+                # Stale cache: different leakage unit was used; delete and rebuild
+                f.unlink()
+            else:
+                return cached
         sp = make_split(self.table(kind), kind, seed, self.cfg, self.groups)
         json.dump(sp, open(f, "w"))
         return sp
@@ -93,12 +141,13 @@ def run_single(ctx: Context, exp: str, model_name: str, split_kind: str, seed: i
     ckpt_it = seed in cfg["plots"].get("checkpoint_seeds", cfg["plots"]["per_run_plot_seeds"])
 
     if model_name in NEURAL:
+        # ── fingerprint-based neural models ──────────────────────────────────
         mcfg = {"hidden": proto["hidden"]} if model_name == "paper_ann" else cfg["models"][model_name]
         head = proto["head"]
         model = build_model(model_name, mcfg, 2 if head == "softmax2" else 1).to(ctx.device)
         meta["n_params"] = n_params(model)
         tr_fit = tr
-        if proto["oversample"] > 1:                     # replicate incompatible pairs, TRAIN ONLY
+        if proto["oversample"] > 1:
             pos = tr[y[tr] == 1]; tr_fit = np.concatenate([tr] + [pos] * (proto["oversample"] - 1))
         out = fit(model, ctx.F, _tensors(ctx, a, b, y, tr_fit), _tensors(ctx, a, b, y, va), proto, criteria,
                   ctx.device, seed, logger, desc=f"{exp[:2]} {model_name[:11]}|{split_kind[:9]}|s{seed}",
@@ -107,7 +156,6 @@ def run_single(ctx: Context, exp: str, model_name: str, split_kind: str, seed: i
         meta.update(epochs_run=out["epochs_run"], best_epoch=best_epoch, pos_weight=out["pos_weight"],
                     train_seconds=out["train_seconds"], train_rows_after_oversampling=int(len(tr_fit)))
         pd.DataFrame(hist).to_csv(run_dir / "training_history.csv", index=False)
-        all_ix = np.arange(len(y))
         for c in criteria:
             model.load_state_dict({k: v.to(ctx.device) for k, v in out["best_state"][c].items()})
             s_va = predict_scores(model, ctx.F, torch.as_tensor(a[va], device=ctx.device), torch.as_tensor(b[va], device=ctx.device), head)
@@ -115,7 +163,7 @@ def run_single(ctx: Context, exp: str, model_name: str, split_kind: str, seed: i
             thr = 0.5 if proto["threshold"] == 0.5 else best_threshold_f1(y[va], s_va)
             r = {"val": compute_metrics(y[va], s_va, thr), "test": compute_metrics(y[te], s_te, thr),
                  "test_at_0.5": compute_metrics(y[te], s_te, 0.5)}
-            if ecfg["protocol"] in ("paper", "paper_clean"):   # paper evaluated confusion matrices on the FULL data
+            if ecfg["protocol"] in ("paper", "paper_clean"):
                 s_all = predict_scores(model, ctx.F, torch.as_tensor(a, device=ctx.device), torch.as_tensor(b, device=ctx.device), head)
                 r["full_dataset"] = compute_metrics(y, s_all, thr)
             r["_scores"] = (s_te, thr); results[c] = r
@@ -126,7 +174,68 @@ def run_single(ctx: Context, exp: str, model_name: str, split_kind: str, seed: i
         if plot_it and hist:
             plots.training_curves_plot(hist, f"{model_name} | {split_kind} | seed {seed} | {exp}",
                                        run_dir / "training_curves.png", best_epoch)
-    else:                                                # classical references
+
+    elif model_name in GNN_NEURAL:
+        # ── graph-based neural models ─────────────────────────────────────────
+        from .gnn import build_gnn_model, n_params as gnn_n_params
+        from .gnn_train import fit_graph, predict_graph_scores
+
+        mcfg = cfg["models"][model_name]
+        head = proto["head"]
+        model = build_gnn_model(model_name, mcfg).to(ctx.device)
+        meta["n_params"] = gnn_n_params(model)
+
+        # Build CID arrays for the graph trainer (not fingerprint row indices)
+        cids_a = table.drug_cid.values
+        cids_b = table.excipient_cid.values
+
+        # Fingerprint matrix (None for gnn_siamese/de_crossnet_no_fp, real matrix for de_crossnet/de_crossnet_self_attn)
+        use_fp = model_name in ("de_crossnet", "de_crossnet_self_attn", "de_crossnet_ordered_head")
+        fp_for_gnn = ctx.F_np if use_fp else None
+
+        tr_fit = tr
+        if proto.get("oversample", 1) > 1:
+            pos = tr[y[tr] == 1]; tr_fit = np.concatenate([tr] + [pos] * (proto["oversample"] - 1))
+
+        out = fit_graph(
+            model=model,
+            graph_cache=ctx.graph_cache,
+            train_cids_a=cids_a[tr_fit], train_cids_b=cids_b[tr_fit],
+            train_y=y[tr_fit],
+            val_cids_a=cids_a[va], val_cids_b=cids_b[va], val_y=y[va],
+            fp_matrix=fp_for_gnn,
+            proto=proto, criteria=criteria, device=ctx.device,
+            seed=seed, logger=logger,
+            desc=f"{exp[:2]} {model_name[:11]}|{split_kind[:9]}|s{seed}",
+            progress=progress, patience=patience,
+            cid_to_row=ctx.row,
+        )
+        hist, best_epoch = out["history"], out["best_epoch"]
+        meta.update(epochs_run=out["epochs_run"], best_epoch=best_epoch,
+                    pos_weight=out["pos_weight"], train_seconds=out["train_seconds"])
+        pd.DataFrame(hist).to_csv(run_dir / "training_history.csv", index=False)
+
+        gnn_bs = proto.get("val_batch_size", proto.get("batch_size", 32))
+        for c in criteria:
+            model.load_state_dict({k: v.to(ctx.device) for k, v in out["best_state"][c].items()})
+            s_va = predict_graph_scores(model, ctx.graph_cache, cids_a[va], cids_b[va],
+                                        fp_for_gnn, head, ctx.device, gnn_bs, cid_to_row=ctx.row)
+            s_te = predict_graph_scores(model, ctx.graph_cache, cids_a[te], cids_b[te],
+                                        fp_for_gnn, head, ctx.device, gnn_bs, cid_to_row=ctx.row)
+            thr = 0.5 if proto.get("threshold") == 0.5 else best_threshold_f1(y[va], s_va)
+            r = {"val": compute_metrics(y[va], s_va, thr), "test": compute_metrics(y[te], s_te, thr),
+                 "test_at_0.5": compute_metrics(y[te], s_te, 0.5)}
+            r["_scores"] = (s_te, thr); results[c] = r
+            if ckpt_it:
+                save_checkpoint(run_dir / f"checkpoint_{c}.pt", out["best_state"][c],
+                                {"model": model_name, "mcfg": mcfg, "head": head, "criterion": c,
+                                 "epoch": best_epoch.get(c), "seed": seed, "split": split_kind})
+        if plot_it and hist:
+            plots.training_curves_plot(hist, f"{model_name} | {split_kind} | seed {seed} | {exp}",
+                                       run_dir / "training_curves.png", best_epoch)
+
+    else:
+        # ── classical baselines ───────────────────────────────────────────────
         t1 = time.time()
         d, e = table.drug_cid.values, table.excipient_cid.values
         if model_name == "rf":
@@ -140,14 +249,15 @@ def run_single(ctx: Context, exp: str, model_name: str, split_kind: str, seed: i
                             "test_at_0.5": compute_metrics(y[te], s_te, 0.5), "_scores": (s_te, thr)}
         meta["train_seconds"] = time.time() - t1; logger.info(f"fit {model_name} in {meta['train_seconds']:.1f}s")
 
-    # ---------- write artefacts ----------
+    # ── write artefacts ───────────────────────────────────────────────────────
     primary_key = primary if primary in results else list(results)[0]
     blocks, txt, rep = {}, [], []
     for c, r in results.items():
         s_te, thr = r.pop("_scores")
         blocks[c] = r
         txt.append(metrics_text(f"{exp} | {model_name} | {split_kind} | seed {seed} | checkpoint={c}",
-                                {"validation": r["val"], "TEST": r["test"], **({"full dataset (paper protocol)": r["full_dataset"]} if "full_dataset" in r else {})}))
+                                {"validation": r["val"], "TEST": r["test"],
+                                 **({f"full dataset (paper protocol)": r["full_dataset"]} if "full_dataset" in r else {})}))
         rep.append(f"### checkpoint={c}  (threshold {thr:.4f})\n" + report_text(y[te], s_te, thr))
         if plot_it:
             sfx = f"_{c}" if len(results) > 1 else ""

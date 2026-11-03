@@ -30,6 +30,7 @@ from .train import make_loss, to_score, save_checkpoint, MODE
 def _make_graph_batch(indices: np.ndarray, graph_cache: dict,
                       cids_a: np.ndarray, cids_b: np.ndarray,
                       fp_matrix: Optional[np.ndarray],
+                      cid_to_row: Optional[dict],
                       device: torch.device):
     """Build a graph batch from a set of row indices.
 
@@ -41,7 +42,12 @@ def _make_graph_batch(indices: np.ndarray, graph_cache: dict,
     graphs_b = [graph_cache[int(cids_b[i])] for i in indices]
     batch_A = collate_graphs(graphs_a, device=device)
     batch_B = collate_graphs(graphs_b, device=device)
-    if fp_matrix is not None:
+    if fp_matrix is not None and cid_to_row is not None:
+        idx_a = [cid_to_row[int(cids_a[i])] for i in indices]
+        idx_b = [cid_to_row[int(cids_b[i])] for i in indices]
+        fp_a = torch.tensor(fp_matrix[idx_a], dtype=torch.float32, device=device)
+        fp_b = torch.tensor(fp_matrix[idx_b], dtype=torch.float32, device=device)
+    elif fp_matrix is not None:
         fp_a = torch.tensor(fp_matrix[[int(cids_a[i]) for i in indices]],
                             dtype=torch.float32, device=device)
         fp_b = torch.tensor(fp_matrix[[int(cids_b[i]) for i in indices]],
@@ -58,14 +64,16 @@ def predict_graph_scores(model: nn.Module,
                          fp_matrix: Optional[np.ndarray],
                          head: str,
                          device: torch.device,
-                         batch_size: int = 32) -> np.ndarray:
+                         batch_size: int = 32,
+                         cid_to_row: Optional[dict] = None) -> np.ndarray:
     """Score all pairs (a[i], b[i]) using the graph model."""
     model.eval()
     out = []
     n = len(cids_a)
     for start in range(0, n, batch_size):
         ix = np.arange(start, min(start + batch_size, n))
-        bA, bB, fpA, fpB = _make_graph_batch(ix, graph_cache, cids_a, cids_b, fp_matrix, device)
+        bA, bB, fpA, fpB = _make_graph_batch(ix, graph_cache, cids_a, cids_b,
+                                              fp_matrix, cid_to_row, device)
         logits = model(bA, bB, fpA, fpB)
         out.append(to_score(logits, head).cpu())
     return torch.cat(out).numpy() if out else np.zeros(0)
@@ -73,14 +81,15 @@ def predict_graph_scores(model: nn.Module,
 
 @torch.no_grad()
 def _graph_val_stats(model, graph_cache, cids_a, cids_b, fp_matrix,
-                     y_tensor: torch.Tensor, head: str, loss_fn,
+                     cid_to_row, y_tensor: torch.Tensor, head: str, loss_fn,
                      device: torch.device, batch_size: int = 32, thr: float = 0.5):
     model.eval()
     logits_list = []
     n = len(cids_a)
     for start in range(0, n, batch_size):
         ix = np.arange(start, min(start + batch_size, n))
-        bA, bB, fpA, fpB = _make_graph_batch(ix, graph_cache, cids_a, cids_b, fp_matrix, device)
+        bA, bB, fpA, fpB = _make_graph_batch(ix, graph_cache, cids_a, cids_b,
+                                              fp_matrix, cid_to_row, device)
         logits_list.append(model(bA, bB, fpA, fpB))
     logits = torch.cat(logits_list)
     loss = loss_fn(logits, y_tensor).item()
@@ -117,7 +126,8 @@ def fit_graph(model: nn.Module,
               logger=None,
               desc: str = "gnn_train",
               progress: bool = True,
-              patience: Optional[int] = None) -> dict:
+              patience: Optional[int] = None,
+              cid_to_row: Optional[dict] = None) -> dict:
     """Full training loop for graph models.
 
     Equivalent interface to train.fit() but adapted for graph batching.
@@ -177,7 +187,7 @@ def fit_graph(model: nn.Module,
             try:
                 bA, bB, fpA, fpB = _make_graph_batch(ix, graph_cache,
                                                       train_cids_a, train_cids_b,
-                                                      fp_matrix, device)
+                                                      fp_matrix, cid_to_row, device)
                 opt.zero_grad(set_to_none=True)
                 if use_amp:
                     with torch.cuda.amp.autocast():
@@ -205,7 +215,7 @@ def fit_graph(model: nn.Module,
 
         avg_loss = tot_loss / max(n_seen, 1)
         st = _graph_val_stats(model, graph_cache, val_cids_a, val_cids_b,
-                               fp_matrix, val_y_tensor, head, loss_fn, device, val_bs)
+                               fp_matrix, cid_to_row, val_y_tensor, head, loss_fn, device, val_bs)
         st.update(epoch=ep, train_loss=avg_loss, elapsed=time.time() - t0)
 
         improved_primary = False
@@ -237,3 +247,4 @@ def fit_graph(model: nn.Module,
     return {"history": history, "best_state": best_state, "best_epoch": best_epoch,
             "best_value": best, "epochs_run": len(history), "pos_weight": pos_w,
             "train_seconds": time.time() - t0}
+

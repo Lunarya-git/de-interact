@@ -8,4 +8,5 @@ tqdm>=4.66
 rdkit>=2023.9
 padelpy>=0.1.16        # bundles PaDEL-Descriptor; requires Java (JRE >= 8) on PATH
 pytest>=7.4
+optuna>=3.5            # hyperparameter optimization on Pool D (Protocol T)
 # PyTorch is installed separately (CUDA build) - see README

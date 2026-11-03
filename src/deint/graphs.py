@@ -245,3 +245,4 @@ def collate_graphs(graphs: list[MolGraph], device="cpu"):
 
     return (x_pad.to(device), mask.to(device), edge_index.to(device),
             edge_attr.to(device), batch.to(device), sizes)
+
