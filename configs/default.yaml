@@ -1,0 +1,83 @@
+# Single source of truth for the whole pipeline.  All paths are relative to the repo root.
+paths:
+  raw_csv: data/raw/drug_excipient_data.csv
+  processed_dir: data/processed
+  results_dir: results
+
+seeds: [0, 1, 2, 3, 4]          # five seeds -> mean +/- std in E3/E4; E1/E2 use the first three
+
+features:
+  chunk_size: 100               # molecules per PaDEL call (resume granularity)
+  padel_timeout: 900            # seconds per chunk
+
+split:
+  train: 0.70
+  val: 0.15
+  test: 0.15
+  min_pos_eval: 8               # val/test must contain >= this many incompatible pairs (split validity rule)
+  min_pos_eval_cold_both: 4
+  cold_both_probs: [0.6, 0.2, 0.2]
+  max_attempts: 500
+  leakage_unit: structure       # cid | structure | parent. 'structure' groups CIDs with identical structure/fingerprint
+                                # (stereo-isomers, anomers, hydrates...) and holds them out together (src/deint/structure.py)
+
+# ---- Paper-faithful protocol (Patel et al. 2023, Sec. 2.2) ----
+paper_protocol:
+  hidden: [1024, 1024, 1024]
+  head: softmax2                # 2 softmax outputs, binary cross-entropy on one-hot targets
+  optimizer: rmsprop
+  lr: 0.001                     # NOT stated in paper: Keras/PyTorch-style default
+  batch_size: 150
+  epochs: 200
+  oversample_factor: 1          # E1: supplied CSV already contains replicated rows
+  oversample_factor_clean: 4    # E2: replicate incompatible x4, TRAIN ONLY (paper: "four times")
+  threshold: 0.5
+  checkpoints: [val_accuracy, val_loss, val_precision]
+
+# ---- Unified protocol used for every model in E3/E4 ----
+unified_protocol:
+  head: logit1
+  optimizer: adamw
+  lr: 0.001
+  weight_decay: 0.0001
+  batch_size: 128
+  epochs: 100
+  patience: 15
+  checkpoint: val_pr_auc
+  pos_weight: auto              # n_neg / n_pos computed on the TRAINING split only
+  threshold: tuned_val_f1       # threshold maximising incompatible-class F1 on validation
+
+models:
+  concat_mlp:                   # paper architecture, unified training
+    hidden: [1024, 1024, 1024]
+    dropout: 0.0
+  concat_mlp_reg:               # same architecture + dropout (ablation: is it just regularisation?)
+    hidden: [1024, 1024, 1024]
+    dropout: 0.3
+  siamese:                      # proposed
+    encoder: [512, 256]
+    head: [128]
+    dropout: 0.3
+    interaction: full           # sum + product + abs-difference
+  siamese_sum:                  # ablation: no explicit pair-interaction terms
+    encoder: [512, 256]
+    head: [128]
+    dropout: 0.3
+    interaction: sum
+  rf:
+    n_estimators: 300
+  entity_prior:
+    smoothing: 2.0
+
+experiments:
+  E1_reproduction:   {split: paper_rows,  models: [paper_ann], protocol: paper,   seeds: 3}
+  E2_leakage_audit:  {split: random_pair, models: [paper_ann], protocol: paper_clean, seeds: 3}
+  E3_generalization: {splits: [random_pair, cold_drug, cold_excipient, cold_both],
+                      models: [concat_mlp, siamese, rf, entity_prior], protocol: unified, seeds: 5}
+  E4_ablation:       {splits: [random_pair, cold_drug, cold_excipient],
+                      models: [siamese_sum, concat_mlp_reg], protocol: unified, seeds: 5}
+
+plots:
+  dpi: 600
+  per_run_plot_seeds: [0]       # per-run PNGs only for these seeds (keeps outputs readable)
+  checkpoint_seeds: [0]         # .pt checkpoints only for these seeds (saves disk; runs are cheap to redo)
