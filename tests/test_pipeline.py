@@ -490,6 +490,7 @@ def test_entity_prior_unseen_gives_prior():
 
 @pytest.mark.skipif(shutil.which("java") is None, reason="Java not installed")
 def test_padel_pubchem_fingerprint():
+    pytest.importorskip("padelpy")
     from deint import features
     smi = ["CC(=O)OC1=CC=CC=C1C(=O)O", "CC(=O)NC1=CC=C(O)C=C1"]
     fps = features.padel_fingerprints(smi)
@@ -627,7 +628,7 @@ def test_gnn_smoke_single_run(tmp_path, cfg):
         graph_cache=cache,
         train_cids_a=cids_a, train_cids_b=cids_b, train_y=y,
         val_cids_a=cids_a, val_cids_b=cids_b, val_y=y,
-        fp_matrix=fp_matrix,
+        fp_matrix=fp,
         proto=proto, criteria=["val_pr_auc"],
         device=torch.device("cpu"), seed=0, logger=None, progress=False, patience=None,
         cid_to_row=cid_to_row,
@@ -666,3 +667,35 @@ def test_aggregation_script(tmp_path, cfg):
                         "--config", str(cfg_path)], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr[-2000:]
     assert (tmp_path / "res_agg" / "summary" / "summary.md").exists()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Stage T: Tuning smoke test
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_stage_t_tuning_smoke(tmp_path, cfg):
+    """Test 1 trial of Stage T hyperparameter tuning on synthetic data."""
+    from deint.tune import run_tuning
+    import copy
+    c = copy.deepcopy(cfg)
+    proc = tmp_path / "proc_tune"; proc.mkdir()
+    pairs = synth_pairs(n_drug=20, n_exc=15, n_pairs=200)
+    pairs.to_csv(proc / "pairs.csv", index=False)
+    raw = pd.concat([pairs, pairs], ignore_index=True)[["drug_cid", "excipient_cid", "label"]]
+    raw.to_csv(proc / "raw_labeled.csv", index=False)
+    mols = np.unique(np.concatenate([pairs.drug_cid, pairs.excipient_cid]))
+    rng = np.random.default_rng(12)
+    np.savez(proc / "fingerprints.npz", fp=(rng.random((len(mols), 881)) < 0.2).astype(np.uint8),
+             cid=mols, ok=np.ones(len(mols), bool))
+    # Fake entity pools
+    pool_dict = {"D_cids": mols.tolist(), "E_cids": [], "D_chem_groups": mols.tolist(), "E_chem_groups": []}
+    (proc / "entity_pools.json").write_text(json.dumps(pool_dict))
+
+    c["paths"].update(processed_dir=str(proc), results_dir=str(tmp_path / "res_tune"),
+                      tuned_configs_dir=str(tmp_path / "cfg_tuned"))
+    c["split"].update(min_pos_eval=1, min_pos_eval_cold_both=1)
+    res = run_tuning("siamese", n_trials=1, cfg=c, device=torch.device("cpu"), progress=False)
+    assert res["model"] == "siamese"
+    assert (tmp_path / "res_tune" / "tuned" / "siamese.yaml").exists()
+    assert (tmp_path / "res_tune" / "tuned" / "siamese_trials.json").exists()
+    assert (tmp_path / "cfg_tuned" / "siamese.yaml").exists()

@@ -184,34 +184,142 @@ def main():
 
     results["benchmarks"] = benchmarks
 
-    # Schedule estimate
+    # Schedule estimate across complete experiment programme
     print("\n" + "=" * 70)
-    print("ESTIMATED SCHEDULE (assuming full training at measured s/epoch):")
-    schedule = []
+    print("CONSERVATIVE SCHEDULE PROJECTION ACROSS FULL EXPERIMENT PROGRAMME:")
+    print("=" * 70)
+    
     cfg_epochs_fp  = cfg["unified_protocol"]["epochs"]
     cfg_epochs_gnn = cfg.get("gnn_protocol", cfg["unified_protocol"])["epochs"]
-    seeds_E3 = cfg["seeds"][: cfg["experiments"]["E3_generalization"]["seeds"]]
-    splits_E3 = cfg["experiments"]["E3_generalization"]["splits"]
-    models_E3 = cfg["experiments"]["E3_generalization"]["models"]
-    for b in benchmarks:
-        if "error" in b or b["s_per_epoch"] is None: continue
-        m = b["model"]
-        eps = cfg_epochs_gnn if m in ("de_crossnet", "gnn_siamese") else cfg_epochs_fp
-        runs_E3 = sum(1 for s in splits_E3 if m in models_E3) * len(seeds_E3)
-        est_h = b["s_per_epoch"] * eps * runs_E3 / 3600 * 1.1  # +10% overhead
-        schedule.append({"model": m, "s_per_epoch": b["s_per_epoch"], "epochs": eps,
-                         "E3_runs": runs_E3, "est_E3_hours": round(est_h, 2)})
-        print(f"  {m:25s} {b['s_per_epoch']:6.1f} s/ep × {eps:3d} ep × {runs_E3:3d} runs ≈ {est_h:.1f} h")
+    
+    # Map benchmarked speeds (s/run)
+    bench_map = {b["model"]: b for b in benchmarks if "error" not in b}
+    def est_run_seconds(m):
+        if m in bench_map:
+            b = bench_map[m]
+            if b["s_per_epoch"] is not None:
+                eps = cfg_epochs_gnn if m in ("de_crossnet", "gnn_siamese", "de_crossnet_no_fp", "de_crossnet_self_attn", "de_crossnet_ordered_head") else cfg_epochs_fp
+                return b["s_per_epoch"] * eps
+            return b["elapsed_s"]
+        # Fallback to closest benchmarked model
+        if "crossnet" in m or "gnn" in m:
+            ref = bench_map.get("de_crossnet", bench_map.get("gnn_siamese", {}))
+            return (ref.get("s_per_epoch", 2.0)) * cfg_epochs_gnn
+        if "siamese" in m:
+            ref = bench_map.get("siamese", {})
+            return (ref.get("s_per_epoch", 0.5)) * cfg_epochs_fp
+        ref = bench_map.get("concat_mlp", {})
+        return (ref.get("s_per_epoch", 0.5)) * cfg_epochs_fp
 
-    total_h = sum(s["est_E3_hours"] for s in schedule)
-    print(f"\n  Total estimated E3 hours: {total_h:.1f} h  (20 h budget, 15–20% reserve)")
-    results["schedule_estimate"] = schedule
-    results["total_E3_hours_estimated"] = round(total_h, 2)
+    exp_schedule = {}
+    total_sec = 0.0
+
+    # ── Stage T: Hyperparameter Tuning on Entity Pool D (Protocol T) ──────
+    # 125 Optuna trials across 4 models: de_crossnet (40), gnn_siamese (30), concat_mlp_reg (30), siamese (25)
+    # Multi-split tuning over 3 splits x 2 seeds = 6 conditions inside Pool D
+    # Pool D contains ~2,031 pairs (~56% of total pairs).
+    # With early-stopping and Optuna median pruning, trials prune early (~3.5 trainings per trial -> ~437 expected trainings)
+    # Wall-clock caps from §15: de_crossnet: 2.2h, gnn_siamese: 0.9h, concat_mlp_reg: 0.45h, siamese: 0.40h (sum: 3.95h)
+    tuning_budgets = {
+        "de_crossnet":    {"trials": 40, "cap_h": 2.2,  "epochs": 22},
+        "gnn_siamese":    {"trials": 30, "cap_h": 0.9,  "epochs": 22},
+        "concat_mlp_reg": {"trials": 30, "cap_h": 0.45, "epochs": 30},
+        "siamese":        {"trials": 25, "cap_h": 0.40, "epochs": 30},
+    }
+    stage_t_sec = 0.0
+    stage_t_breakdown = {}
+    for tm, tinfo in tuning_budgets.items():
+        base_s_ep = bench_map.get(tm, {}).get("s_per_epoch")
+        if base_s_ep is None:
+            base_s_ep = 4.0 if "crossnet" in tm else (2.0 if "gnn" in tm else 0.5)
+        # Expected trainings: trials * 3.5 with median pruner
+        exp_trainings = tinfo["trials"] * 3.5
+        # Training in Pool D takes ~0.56x full epoch time due to smaller pool size
+        est_sec = exp_trainings * (base_s_ep * 0.56 * tinfo["epochs"]) * 1.10
+        model_h = min(est_sec / 3600.0, tinfo["cap_h"])
+        stage_t_breakdown[tm] = {
+            "trials": tinfo["trials"],
+            "expected_trainings": int(exp_trainings),
+            "estimated_hours": round(model_h, 2),
+            "cap_hours": tinfo["cap_h"]
+        }
+        stage_t_sec += model_h * 3600.0
+
+    stage_t_h = stage_t_sec / 3600.0
+    exp_schedule["Stage_T_tuning"] = {
+        "total_trials": 125,
+        "expected_trainings": 437,
+        "estimated_hours": round(stage_t_h, 2),
+        "wall_clock_cap_hours": 3.95,
+        "models": stage_t_breakdown
+    }
+    total_sec += stage_t_sec
+    print(f"  {'Stage_T_tuning':20s}: 125 trials (~437 trainings) -> ~{stage_t_h:5.2f} hours (cap: 3.95 h)")
+
+    for exp_id in ["E1_reproduction", "E2_leakage_audit", "E3_generalization", "E4_ablation"]:
+        if exp_id not in cfg["experiments"]:
+            continue
+        ecfg = cfg["experiments"][exp_id]
+        splits = ecfg.get("splits", [ecfg.get("split", "random_pair")])
+        models = ecfg.get("models", [])
+        seeds = cfg["seeds"][: ecfg.get("seeds", 1)]
+        exp_runs = len(splits) * len(models) * len(seeds)
+        exp_sec = sum(est_run_seconds(m) for m in models) * len(splits) * len(seeds)
+        exp_h = (exp_sec / 3600.0) * 1.15  # +15% validation/checkpoint overhead
+        exp_schedule[exp_id] = {
+            "splits": len(splits), "models": len(models), "seeds": len(seeds),
+            "total_runs": exp_runs, "estimated_hours": round(exp_h, 2)
+        }
+        total_sec += exp_sec * 1.15
+        print(f"  {exp_id:20s}: {exp_runs:3d} runs  ->  ~{exp_h:5.2f} hours")
+
+    # E5 sensitivity estimate
+    if "E5_sensitivity" in cfg["experiments"]:
+        e5_cfg = cfg["experiments"]["E5_sensitivity"]
+        e5_units = len(e5_cfg.get("leakage_units", ["chem", "struct", "parent"]))
+        e5_splits = len(e5_cfg.get("splits", ["random_pair", "cold_drug"]))
+        e5_models = e5_cfg.get("models", ["de_crossnet", "siamese"])
+        e5_seeds = len(cfg["seeds"][: e5_cfg.get("seeds", 1)])
+        e5_runs = e5_units * e5_splits * len(e5_models) * e5_seeds
+        e5_sec = sum(est_run_seconds(m) for m in e5_models) * e5_units * e5_splits * e5_seeds * 1.15
+        e5_h = e5_sec / 3600.0
+        exp_schedule["E5_sensitivity"] = {"total_runs": e5_runs, "estimated_hours": round(e5_h, 2)}
+        total_sec += e5_sec
+        print(f"  {'E5_sensitivity':20s}: {e5_runs:3d} runs  ->  ~{e5_h:5.2f} hours")
+
+    # E6 attention estimate (inference on ~10 pairs)
+    e6_h = 0.05
+    exp_schedule["E6_attention"] = {"estimated_hours": e6_h}
+    total_sec += e6_h * 3600.0
+    print(f"  {'E6_attention':20s}: inference only ->  ~{e6_h:5.2f} hours")
+
+    total_programme_hours = total_sec / 3600.0
+    budget_hours = 20.0
+    reserve_hours = budget_hours - total_programme_hours
+    reserve_pct = (reserve_hours / budget_hours) * 100.0
+    gate_pass = (reserve_pct >= 15.0 and total_programme_hours <= budget_hours)
+
+    print("-" * 70)
+    print(f"  Total Estimated Programme Runtime: {total_programme_hours:5.2f} hours")
+    print(f"  Available Hardware Budget:          {budget_hours:5.2f} hours")
+    print(f"  Reserve Safety Margin:              {reserve_hours:5.2f} hours ({reserve_pct:.1f}%)")
+    print(f"  Benchmark Gate Verdict:             {'PASS (Ready to proceed)' if gate_pass else 'WARNING (Budget tight)'}")
+    print("=" * 70)
+
+    results["schedule"] = {
+        "experiments": exp_schedule,
+        "total_programme_hours": round(total_programme_hours, 2),
+        "budget_hours": budget_hours,
+        "reserve_margin_hours": round(reserve_hours, 2),
+        "reserve_percent": round(reserve_pct, 1),
+        "gate_status": "PASS" if gate_pass else "WARNING"
+    }
+    results["total_E3_hours_estimated"] = round(exp_schedule.get("E3_generalization", {}).get("estimated_hours", 0.0), 2)
 
     out_path = resolve(cfg, "results_dir") / "E0_benchmark.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     save_json(results, out_path)
-    print(f"\nResults saved to {out_path}")
+    print(f"\nBenchmark gate report written to {out_path}\n")
 
 
 if __name__ == "__main__":

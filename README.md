@@ -27,8 +27,8 @@
 
 ## 1. Project Overview & Core Contributions
 
-Patel et al. (2023) introduced DE-INTERACT, an Artificial Neural Network predicting drug–excipient incompatibility from concatenated 881-bit PubChem fingerprints. The paper reported 98.4% accuracy and 98% recall. However, our dataset audit revealed:
-1. **Duplicate-Pair Leakage:** The raw dataset contains extensive row-level duplications (only 3,609 unique pairs across 4,248 rows; 639 duplicate rows). Evaluating on random row splits leaks identical molecular pairs into both train and test partitions.
+Patel et al. (2023) introduced DE-INTERACT, an Artificial Neural Network predicting drug–excipient incompatibility from concatenated 881-bit PubChem fingerprints. The paper reported 98.4% accuracy and 98% recall on 3,728 literature-derived interaction pairs (3,549 compatible, 179 incompatible) across 739 unique nodes. However, our dataset audit of the supplied CSV revealed:
+1. **Duplicate-Pair Leakage:** The raw supplied dataset contains 10,754 rows with 7,145 exact duplicate rows, collapsing to 3,609 unique CID pairs (3,358 compatible, 251 incompatible, 6.95% positive class) across 799 unique molecules (520 drugs, 283 excipients, 4 dual-role). Evaluating on random row splits leaks identical molecular pairs into both train and test partitions.
 2. **Chemical-Structure Leakage:** Molecules often exist under multiple database identifiers (isomers, anomers, salts, hydrates). Random CID-based splits leave 19.6% of test molecules with structural twins in training.
 3. **Role Asymmetry:** The original concatenation model treats $(A, B)$ and $(B, A)$ differently, failing physical permutation symmetry.
 4. **Lack of Interaction Modeling:** Concatenating fingerprints forces dense layers to learn complex cross-molecular interactions without geometric or atom-level inductive bias.
@@ -84,12 +84,12 @@ MLP Classification Head ──► Logit ──► Sigmoid ──► P(Incompatib
 
 | Model Identifier | Architecture Description | Input Modality | Parameters |
 | :--- | :--- | :--- | :--- |
-| `de_crossnet` | **Proposed:** GINE encoder + Cross-Attention + PubChem FP + Symmetric Head | Molecular Graph + 881-bit FP | ~0.94 M |
-| `gnn_siamese` | **Graph Baseline:** GINE encoder + Readout + Symmetric Head (No FP, No Cross-Attn) | Molecular Graph | ~0.62 M |
-| `siamese` (`siamese_fp`) | **FP Baseline:** Shared 2-layer MLP encoder + Symmetric interaction terms | 881-bit PubChem FP | ~0.71 M |
-| `concat_mlp` | **Paper Reproduction:** 3 × 1024 ReLU MLP with unified BCE loss | Concatenated FP (1762-d) | ~3.87 M |
-| `concat_mlp_reg` | Same 3 × 1024 MLP with 0.3 Dropout & AdamW weight decay | Concatenated FP (1762-d) | ~3.87 M |
-| `paper_ann` | Paper-faithful protocol: 3 × 1024, Softmax-2, RMSprop, oversampled | Concatenated FP (1762-d) | ~3.87 M |
+| `de_crossnet` | **Proposed:** GINE encoder + Cross-Attention + PubChem FP + Symmetric Head | Molecular Graph + 881-bit FP | 2,054,022 (~2.05 M) |
+| `gnn_siamese` | **Graph Baseline:** GINE encoder + Readout + Symmetric Head (No FP, No Cross-Attn) | Molecular Graph | 1,171,718 (~1.17 M) |
+| `siamese` (`siamese_fp`) | **FP Baseline:** Shared MLP encoder [512, 256, 128] + Symmetric Head [128, 64] | 881-bit PubChem FP | 681,473 (~0.68 M) |
+| `concat_mlp` | **Reproduced MLP:** 5-layer MLP [1024, 1024, 512, 256, 128] with unified BCE loss | Concatenated FP (1762-d) | 3,905,537 (~3.91 M) |
+| `concat_mlp_reg` | Same 5-layer MLP with 0.3 Dropout & AdamW weight decay | Concatenated FP (1762-d) | 3,905,537 (~3.91 M) |
+| `paper_ann` | Paper-faithful protocol: 3 × 64, Softmax-2, RMSprop, oversampled | Concatenated FP (1762-d) | 121,282 (~121 K) |
 | `rf` | Balanced Random Forest (300 estimators) | Concatenated FP (1762-d) | Classical |
 | `entity_prior` | Naive Bayes empirical entity incompatibility rate diagnostic | Molecule CID only | Classical |
 
@@ -128,47 +128,52 @@ To prevent data snooping and false optimism, three strict leakage barriers are e
 ## 4. Windows Installation & CUDA Setup (NVIDIA RTX 3050)
 
 ### System Requirements
-- OS: Windows 10/11 64-bit
-- GPU: NVIDIA GeForce RTX 3050 Laptop GPU (4 GB VRAM)
-- Driver: NVIDIA Driver $\ge$ 528.33 (CUDA 12.x support)
-- Java: JRE $\ge$ 8 installed and on PATH (for PaDEL-Descriptor PubChem fingerprints)
-- Python: Python 3.10 or 3.11 64-bit
+- **OS**: Windows 10/11 64-bit
+- **GPU**: NVIDIA GeForce RTX 3050 Laptop GPU (4 GB VRAM)
+- **Driver**: NVIDIA Driver $\ge$ 528.33 (CUDA 12.x support)
+- **Java**: JRE $\ge$ 8 installed and on PATH (for PaDEL-Descriptor PubChem fingerprints)
+- **Python**: Python 3.11 (Recommended) or Python 3.12 (with NumPy `<2.0.0` C-ABI compatibility)
 
-### 1. Environment Setup
-Open PowerShell as Administrator (or standard terminal) in the project directory:
+### Automated 1-Step Setup (Recommended)
+We provide an automated setup script that cleanly wipes any stale `.venv` (preventing C-extension version mismatch between Python 3.11 and 3.12), creates a fresh `.venv`, installs PyTorch with CUDA 12.1 acceleration, installs pinned dependencies, and verifies GPU detection:
 
 ```powershell
-# Navigate to repository root
-cd c:\Users\HP\Desktop\SNUC\de-interact
+# Open PowerShell in project directory and run:
+powershell -ExecutionPolicy Bypass -File scripts\setup_windows.ps1
+```
 
-# Create and activate virtual environment
+To specify an explicit Python binary (e.g., Python 3.11 or 3.12):
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\setup_windows.ps1 -PythonExe "py -3.11"
+```
+
+---
+
+### Manual Setup (Step-by-Step)
+If you prefer setting up manually from your terminal:
+
+```powershell
+# 1. Remove old virtual environment to eliminate compiled C-ABI conflicts
+if (Test-Path .venv) { Remove-Item -Recurse -Force .venv }
+
+# 2. Create clean virtual environment (using Python 3.11 or 3.12)
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-```
 
-*(If script execution is disabled in PowerShell, run `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` first).*
+# 3. Upgrade pip and build tools
+python -m pip install --upgrade pip setuptools wheel
 
-### 2. PyTorch with CUDA 12.1 / 12.4
-Install the CUDA-enabled PyTorch build:
-
-```powershell
+# 4. Install CUDA-enabled PyTorch (CUDA 12.1 for RTX 3050 Ampere architecture)
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-```
 
-Verify GPU detection:
-```powershell
-python -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('Device:', torch.cuda.get_device_name(0))"
-```
-*Expected output: `CUDA available: True`, `Device: NVIDIA GeForce RTX 3050 Laptop GPU`.*
-
-### 3. Install Dependencies
-```powershell
+# 5. Install project requirements (with pinned NumPy <2.0 for RDKit compatibility)
 pip install -r requirements.txt
-```
 
-Verify Java for PaDEL:
-```powershell
-java -version
+# 6. Verify environment and GPU detection
+python -c "import torch, numpy, pandas, sklearn, rdkit, optuna; print('CUDA Ready:', torch.cuda.is_available()); print('Device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
+
+# 7. Run test suite
+pytest tests -v
 ```
 
 ---
@@ -196,20 +201,25 @@ python scripts/03_make_splits.py
 ## 6. Step-by-Step Execution Guide
 
 ### Automated All-in-One Execution (Recommended)
-Run the complete pipeline with logging and automated checkpoint handling:
+Run the complete pipeline with strict error checking, benchmark gating, hyperparameter tuning on Pool D, and automated checkpoint handling:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\run_all.ps1 -Device cuda
 ```
+
+**Key Execution Features:**
+- **Strict Error Handling:** Explicitly verifies `$LASTEXITCODE` after every Python invocation and terminates immediately on failure, preventing cascading errors.
+- **Benchmark Gate E0:** Benchmarks GPU throughput per model, estimates total programme runtime (including Stage T), and stops for user approval before long runs. Use `-AutoApprove` for automated runs.
+- **Integrated Stage T (Protocol T):** Executes 125 Optuna trials across 4 models inside Entity Pool D, freezes winning hyperparameters to `configs/tuned/` and `results/tuned/`, and automatically loads them for E3/E4. (Pass `-SkipTuning` if you wish to run evaluation using default hyperparameters).
 
 ---
 
 ### Modular Individual Execution
 
 #### Step 1: Run the Comprehensive Test Suite
-Execute the 30+ unit and integration tests (synthetic data, no GPU needed):
+Execute the 42 test functions / 53 test cases (synthetic data, no GPU needed):
 ```powershell
-pytest tests -q -v
+pytest tests -v
 ```
 
 #### Step 2: Stage 0 — GPU Benchmark Gate (E0)
@@ -299,21 +309,26 @@ On an NVIDIA RTX 3050 (4 GB VRAM), the total runtime budget is **20 hours**. Wit
 
 ## 8. Testing & Verification
 
-The suite includes 38 rigorous unit and regression tests in `tests/test_pipeline.py`.
+The test suite comprises 42 test functions across `tests/test_pipeline.py`, yielding 53 collected test items when parametrized across splits and architectures. All tests execute on self-contained synthetic data without requiring network access or external Java installations.
 
 Run tests:
 ```powershell
 pytest tests -v
 ```
 
+Execution Status:
+- **52 PASSED, 1 SKIPPED, 0 FAILED** (completed in ~53s on CPU).
+- The 1 skipped test (`test_padel_pubchem_fingerprint`) gracefully skips if `padelpy` or Java is absent from the runtime environment.
+
 ### Verified Test Areas
 1. **Data Cleaning:** Deterministic deduplication, label mapping (`Compatible` $\to$ 0, `Imcompatible` $\to$ 1), conflicting label detection.
 2. **Leakage Invariance:** Injected leak detector catches pair and entity leakage; verifies 0% entity overlap in cold splits.
 3. **Chemistry Grouping:** Verifies stereoisomers merge into identical `chem_group`; asserts fingerprint collisions do **not** merge distinct chemical structures.
 4. **Entity Pool Independence:** Asserts that development pool D and evaluation pool E have 0 overlapping molecules and 0 overlapping chemical groups.
-5. **Model Permutation Symmetry:** Asserts $f(A, B) \equiv f(B, A)$ for `de_crossnet`, `gnn_siamese`, and `siamese_fp`; asserts failure for asymmetric models (`concat_mlp`, `de_crossnet_ordered_head`).
-6. **Padding Invariance:** Injected noise into padding atoms does not alter model predictions.
-7. **End-to-End Smoke Tests:** Simulates complete training, checkpoint saving, metric logging, resuming, and result aggregation on synthetic data.
+5. **Stage T Tuning Protocol:** Verifies hyperparameter sampling, multi-split validation on Pool D, and winning config freezing to `configs/tuned/` and `results/tuned/`.
+6. **Model Permutation Symmetry:** Proves $f(A, B) \equiv f(B, A)$ within $10^{-6}$ numerical tolerance for `de_crossnet`, `gnn_siamese`, and `siamese_fp` via shared `LayerNorm` and symmetric readout pooling; confirms failure for asymmetric controls (`concat_mlp`, `de_crossnet_ordered_head`).
+7. **Padding Invariance:** Injected noise into padding atoms does not alter model predictions.
+8. **End-to-End Smoke Tests:** Simulates complete training, checkpoint saving, metric logging, resuming, and result aggregation on synthetic data.
 
 ---
 

@@ -166,8 +166,8 @@ class BidirectionalCrossAttention(nn.Module):
         self.W_V = nn.Linear(d_h, d_h, bias=False)
         self.out_proj = nn.Linear(d_h, d_h, bias=False)
 
-        self.norm_A = nn.LayerNorm(d_h)
-        self.norm_B = nn.LayerNorm(d_h)
+        # Shared LayerNorm for both directions (guarantees f(A,B) = f(B,A))
+        self.norm = nn.LayerNorm(d_h)
         self.drop = nn.Dropout(dropout)
 
     def _attend(self, Q_src: Tensor, K_tgt: Tensor, V_tgt: Tensor,
@@ -220,8 +220,8 @@ class BidirectionalCrossAttention(nn.Module):
             ctx_A = self._attend(Q_A, K_B, V_B, mask_B)
             ctx_B = self._attend(Q_B, K_A, V_A, mask_A)
 
-        H_A_out = self.norm_A(H_A + ctx_A)
-        H_B_out = self.norm_B(H_B + ctx_B)
+        H_A_out = self.norm(H_A + ctx_A)
+        H_B_out = self.norm(H_B + ctx_B)
         return H_A_out, H_B_out
 
 

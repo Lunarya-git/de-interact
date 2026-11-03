@@ -131,6 +131,9 @@ def load_entity_pools(proc_dir: Path, seed: int = 42) -> dict | None:
     path = proc_dir / f"entity_pools_seed{seed}.json"
     if path.exists():
         return json.loads(path.read_text())
+    path_default = proc_dir / "entity_pools.json"
+    if path_default.exists():
+        return json.loads(path_default.read_text())
     return None
 
 

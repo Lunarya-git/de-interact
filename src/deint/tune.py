@@ -241,15 +241,22 @@ def run_tuning(model_name: str, n_trials: int, cfg: dict, device: torch.device,
     tuned_dir = resolve(cfg, "results_dir") / "tuned"
     tuned_dir.mkdir(parents=True, exist_ok=True)
     out_file = tuned_dir / f"{model_name}.yaml"
+    payload = {"model": model_name, "best_score": best_score,
+               "best_params": best_params, "trials": len(trials_log)}
     with open(out_file, "w") as f:
-        yaml.safe_dump({"model": model_name, "best_score": best_score,
-                        "best_params": best_params, "trials": len(trials_log)}, f, sort_keys=False)
+        yaml.safe_dump(payload, f, sort_keys=False)
+
+    # Also mirror to configs/tuned/ for project configuration freeze
+    cfg_tuned_dir = Path(cfg.get("paths", {}).get("tuned_configs_dir", "configs/tuned"))
+    cfg_tuned_dir.mkdir(parents=True, exist_ok=True)
+    with open(cfg_tuned_dir / f"{model_name}.yaml", "w") as f:
+        yaml.safe_dump(payload, f, sort_keys=False)
 
     log_file = tuned_dir / f"{model_name}_trials.json"
     save_json({"model": model_name, "best_score": best_score,
                "best_params": best_params, "trials": trials_log}, log_file)
 
     print(f"\nTuning complete for {model_name}: Best mean val PR-AUC = {best_score:.4f}")
-    print(f"Saved winning config to {out_file}")
+    print(f"Saved winning config to {out_file} and {cfg_tuned_dir / f'{model_name}.yaml'}")
     return {"model": model_name, "best_score": best_score, "best_params": best_params}
 

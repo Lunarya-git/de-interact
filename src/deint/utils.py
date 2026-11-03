@@ -81,6 +81,19 @@ def file_logger(path: Path, name: str) -> logging.Logger:
     return logger
 
 
+def close_logger(logger: logging.Logger) -> None:
+    """Close and remove all handlers from a logger to release Windows file locks."""
+    if logger is None:
+        return
+    for h in list(logger.handlers):
+        try:
+            h.flush()
+            h.close()
+        except Exception:
+            pass
+        logger.removeHandler(h)
+
+
 class Timer:
     def __init__(self): self.t0 = time.time()
     def elapsed(self) -> float: return time.time() - self.t0

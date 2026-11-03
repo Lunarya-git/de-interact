@@ -345,7 +345,7 @@ The planned total is deliberately far below 20 h because every GPU number is an 
 | **0f** | HPO on Entity Pool D (Protocol T) | `tune.py`, `scripts/06_tune.py` | Multi-split optimization over 3 splits × 2 seeds strictly inside Pool D; frozen configs to `results/tuned/` | **[DONE]** |
 | **0g** | Aggregation & Statistics | `scripts/05_aggregate_results.py` | Aggregates all neural and classical models; paired differences, win counts, 600 DPI figures | **[DONE]** |
 | **0h** | Sensitivity (E5) & Interpretability (E6) | `scripts/07_sensitivity.py`, `scripts/06_attention.py` | Fingerprint-collision stratification post-hoc; label conflict exclusion; cross-attention map visualizer | **[DONE]** |
-| **0i** | Comprehensive Test Suite | `tests/test_pipeline.py` | 38 unit & regression tests; symmetry, padding invariance, leakage assertions, smoke runs | **[DONE]** |
+| **0i** | Comprehensive Test Suite | `tests/test_pipeline.py` | 42 unit & regression tests (53 collected items); symmetry, padding invariance, leakage assertions, Stage T tuning smoke runs (52 passed, 1 skipped) | **[DONE]** |
 
 ## 17. Fit to the 6-page IEEE report (template outline is fixed; exactly 6 pages incl. references)
 Planned from the start; content that does not fit stays in this file.
